@@ -1,0 +1,257 @@
+
+name: PS5 Virtual - RPCSX + Tailscale + RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ps5-virtual-build
+  cancel-in-progress: false
+
+jobs:
+  ps5-virtual:
+    name: Prepare PS5 Emulator Environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Desktop, RDP and Build Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            git \
+            pkg-config \
+            g++-14 \
+            libunwind-dev \
+            libsox-dev \
+            libasound2-dev \
+            nasm \
+            libglfw3-dev \
+            libvulkan-dev \
+            vulkan-validationlayers \
+            mesa-utils \
+            vulkan-tools \
+            xfce4 \
+            xfce4-goodies \
+            xrdp \
+            xorgxrdp \
+            dbus-x11 \
+            openssl \
+            curl \
+            ca-certificates \
+            pciutils
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Verify Tailscale Connection
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tailscale status
+          tailscale ip -4
+
+      - name: Configure Remote Desktop and Generate Access Code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+          test -n "$TS_IP"
+
+          # Create a dedicated remote desktop user.
+          if ! id ps5remote >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash ps5remote
+          fi
+
+          # Generate a random password for this session.
+          ACCESS_CODE="$(openssl rand -hex 8)"
+          echo "::add-mask::$ACCESS_CODE"
+          printf '%s:%s\n' ps5remote "$ACCESS_CODE" \
+            | sudo chpasswd
+
+          # Configure the XFCE desktop session.
+          sudo tee /home/ps5remote/.xsession >/dev/null <<'EOF'
+          #!/bin/sh
+          exec startxfce4
+          EOF
+
+          sudo chmod +x /home/ps5remote/.xsession
+          sudo chown ps5remote:ps5remote \
+            /home/ps5remote/.xsession
+
+          # Restrict XRDP to the private Tailscale interface.
+          sudo python3 - "$TS_IP" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path("/etc/xrdp/xrdp.ini")
+          lines = path.read_text().splitlines()
+          output = []
+          in_globals = False
+          found_globals = False
+          found_address = False
+
+          for line in lines:
+              stripped = line.strip()
+
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  if in_globals and not found_address:
+                      output.append("address=" + sys.argv[1])
+                      found_address = True
+
+                  in_globals = stripped.lower() == "[globals]"
+                  found_globals |= in_globals
+                  output.append(line)
+                  continue
+
+              if in_globals and stripped.lower().startswith("address="):
+                  output.append("address=" + sys.argv[1])
+                  found_address = True
+              else:
+                  output.append(line)
+
+          if not found_globals:
+              raise SystemExit("XRDP [Globals] section not found")
+
+          if in_globals and not found_address:
+              output.append("address=" + sys.argv[1])
+
+          path.write_text("\n".join(output) + "\n")
+          PY
+
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+
+          # Keep credentials in the workflow summary.
+          # Treat the run summary as sensitive information.
+          {
+            echo "## Remote Desktop Session"
+            echo ""
+            echo "- Tailscale IP: \`$TS_IP\`"
+            echo "- RDP port: \`3389\`"
+            echo "- Username: \`ps5remote\`"
+            echo "- Password: \`$ACCESS_CODE\`"
+            echo ""
+            echo "Do not share this run or its summary."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Remote desktop configured."
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Show System Hardware
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== OPERATING SYSTEM ====="
+          cat /etc/os-release
+
+          echo "===== ARCHITECTURE ====="
+          uname -m
+
+          echo "===== CPU ====="
+          lscpu
+
+          echo "===== MEMORY ====="
+          free -h
+
+          echo "===== STORAGE ====="
+          df -h
+
+          echo "===== GRAPHICS DEVICES ====="
+          lspci | grep -Ei 'vga|3d|display' || true
+
+          echo "===== VULKAN ====="
+          vulkaninfo --summary || true
+
+          echo "===== TAILSCALE ====="
+          tailscale status
+
+      - name: Download RPCSX Source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone --recursive \
+            https://github.com/RPCSX/rpcsx.git rpcsx
+
+          cd rpcsx
+          git rev-parse HEAD | tee ../rpcsx-commit.txt
+
+      - name: Configure RPCSX
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd rpcsx
+
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14
+
+      - name: Compile RPCSX
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd rpcsx
+          cmake --build build --parallel 2
+
+      - name: Verify Remote Desktop
+        if: always()
+        shell: bash
+        run: |
+          echo "===== XRDP STATUS ====="
+          systemctl status xrdp --no-pager || true
+
+          echo "===== RDP PORT ====="
+          sudo ss -lntp | grep ':3389' || true
+
+          echo "===== TAILSCALE STATUS ====="
+          tailscale status || true
+
+      - name: Collect Build Report
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build-report
+
+          {
+            echo "PS5 Virtual Build Report"
+            date -u
+            uname -a
+            free -h
+            df -h
+          } > build-report/system.txt
+
+          if [ -f rpcsx-commit.txt ]; then
+            cp rpcsx-commit.txt build-report/
+          fi
+
+          if [ -d rpcsx/build ]; then
+            find rpcsx/build -type f -executable \
+              -print > build-report/executables.txt || true
+          fi
+
+      - name: Upload Build Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps5-virtual-rpcsx-build
+          path: |
+            rpcsx/build/
+            rpcsx-commit.txt
+            build-report/
+          if-no-files-found: warn
+          retention-days: 3
+          
